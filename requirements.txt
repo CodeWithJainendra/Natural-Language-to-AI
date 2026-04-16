@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic
+transformers
+torch
+accelerate
+sqlparse
+sqlglot
