@@ -6,3 +6,4 @@ torch
 accelerate
 sqlparse
 sqlglot
+requests
