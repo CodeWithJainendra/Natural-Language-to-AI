@@ -192,12 +192,12 @@ async def call_openrouter(question: str, extra_messages: Optional[list] = None) 
         "model": OPENROUTER_MODEL,
         "messages": messages,
         "temperature": 0.1,
-        "max_tokens": 2048,
+        "max_tokens": 16384,
         # Most OpenRouter models honour this; unsupported models simply ignore it.
         "response_format": {"type": "json_object"},
     }
 
-    async with httpx.AsyncClient(timeout=90.0) as client:
+    async with httpx.AsyncClient(timeout=180.0) as client:
         resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
@@ -218,7 +218,7 @@ async def call_openrouter(question: str, extra_messages: Optional[list] = None) 
         )},
     ]
     retry_payload = {**payload, "messages": retry_messages, "temperature": 0.0}
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(OPENROUTER_URL, headers=headers, json=retry_payload)
         resp.raise_for_status()
         data = resp.json()
@@ -236,6 +236,25 @@ async def call_openrouter(question: str, extra_messages: Optional[list] = None) 
         ),
         "sql": None,
     }
+
+
+_WRITE_KEYWORDS = re.compile(
+    r'\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|GRANT|REVOKE|RENAME)\b',
+    re.IGNORECASE,
+)
+
+
+def is_safe_read_sql(sql: str) -> bool:
+    """Allow SELECT and CTE (WITH ... SELECT) queries; block any write/DDL keywords."""
+    if not sql:
+        return False
+    stripped = sql.strip().lstrip('(').lstrip()
+    first_word = stripped.split(None, 1)[0].upper() if stripped else ""
+    if first_word not in ("SELECT", "WITH"):
+        return False
+    if _WRITE_KEYWORDS.search(sql):
+        return False
+    return True
 
 
 def normalize_question(q: str) -> str:
@@ -336,8 +355,8 @@ async def ask_ai(req: AskAIRequest):
                     }
 
                 # Data intent — execute the SQL
-                sql = sql.strip()
-                if not sql.upper().startswith("SELECT"):
+                sql = sql.strip().rstrip(';').strip()
+                if not is_safe_read_sql(sql):
                     return {
                         "success": True, "answer_type": "text",
                         "message": "I can only answer data retrieval questions.",
@@ -362,8 +381,8 @@ async def ask_ai(req: AskAIRequest):
                                 {"role": "user", "content": correction_prompt},
                             ],
                         )
-                        retry_sql = (retry_response.get("sql") or "").strip()
-                        if retry_sql and retry_sql.upper().startswith("SELECT"):
+                        retry_sql = (retry_response.get("sql") or "").strip().rstrip(';').strip()
+                        if is_safe_read_sql(retry_sql):
                             rows = execute_sql(retry_sql)
                             sql = retry_sql
                             reply = retry_response.get("reply") or reply
@@ -405,7 +424,7 @@ async def ask_ai(req: AskAIRequest):
                 "sql": None, "data": None
             }
 
-        if not fsql.strip().upper().startswith("SELECT"):
+        if not is_safe_read_sql(fsql.strip().rstrip(';').strip()):
             return {
                 "success": True, "answer_type": "text",
                 "message": "I can only answer data retrieval questions.",
