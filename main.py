@@ -34,10 +34,12 @@ app.add_middleware(
 )
 
 # How often the background task re-introspects the live DB to refresh the
-# schema prompt. Defaults to 30 minutes. Ingestion pipelines should also
-# POST to /admin/refresh-schema after a bulk load so the change is picked
-# up immediately instead of waiting for the next tick.
-SCHEMA_REFRESH_INTERVAL_SEC = int(os.getenv("SCHEMA_REFRESH_INTERVAL_SEC", "1800"))
+# schema prompt. Defaults to 24 hours — matches the nightly ingestion
+# cadence. The ingestion pipeline should POST to /admin/refresh-schema
+# right after it finishes loading new data, so changes are visible within
+# seconds. This daily background tick is just a safety net in case the
+# ingestion script ever forgets to call the endpoint.
+SCHEMA_REFRESH_INTERVAL_SEC = int(os.getenv("SCHEMA_REFRESH_INTERVAL_SEC", "86400"))
 
 
 @app.on_event("startup")
