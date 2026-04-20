@@ -4,3 +4,8 @@ __pycache__/
 .env
 *.log
 .ipynb_checkpoints/
+
+# Pincode-master lookup: generated from the cleaned-up IPPB CSV in the
+# DLCPension frontend repo. Regenerate with that repo's
+# `node scripts/build-pincode-master.js` and copy pincode-master.json here.
+pincode-master.json

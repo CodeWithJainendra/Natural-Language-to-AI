@@ -490,6 +490,96 @@ def execute_sql(sql: str) -> list:
     return rows
 
 
+# ── Pincode-master: authoritative pincode → district mapping ────────────────
+# The `district` column on `all_pensioners` is known to be dirty (wrong values
+# tagged during data ingestion — e.g. a pensioner with pincode 110037 carrying
+# district="KANPUR NAGAR"). Any query of the form `WHERE district = 'X'`
+# therefore over-counts.
+#
+# This rewriter loads a pre-built pincode → {state, district, lat, lng} lookup
+# (generated from the cleaned-up IPPB CSV; same file the map frontend uses —
+# single source of truth) and substitutes district-filter predicates with an
+# explicit IN-list of valid pincodes. For Kanpur Nagar the 136 dirty pincodes
+# collapse to the 40 genuine ones. Unknown districts are left untouched so
+# behavior for anything outside the master stays exactly as before.
+
+_PINCODE_MASTER_PATH = os.path.join(os.path.dirname(__file__), "pincode-master.json")
+_DISTRICT_TO_PINCODES: dict = {}
+
+
+def _normalize_district_name(s: str) -> str:
+    """Match the frontend MapAnalysis normalization: trim, collapse spaces, uppercase."""
+    return re.sub(r"\s+", " ", (s or "").strip()).upper()
+
+
+def _load_pincode_master() -> None:
+    """Populate _DISTRICT_TO_PINCODES from pincode-master.json. Safe to call
+    multiple times — rebuilds the index each call."""
+    global _DISTRICT_TO_PINCODES
+    try:
+        with open(_PINCODE_MASTER_PATH, encoding="utf-8") as f:
+            master = json.load(f)
+    except FileNotFoundError:
+        print(f"[pincode-master] file not found: {_PINCODE_MASTER_PATH} — rewriter disabled")
+        _DISTRICT_TO_PINCODES = {}
+        return
+    except Exception as err:
+        print(f"[pincode-master] load failed ({err}) — rewriter disabled")
+        _DISTRICT_TO_PINCODES = {}
+        return
+
+    idx: dict = {}
+    for pin, meta in master.items():
+        d = _normalize_district_name(meta.get("district", ""))
+        if not d:
+            continue
+        idx.setdefault(d, []).append(pin)
+    _DISTRICT_TO_PINCODES = idx
+    print(f"[pincode-master] loaded {len(master)} pincodes across {len(idx)} districts")
+
+
+# Load at module import so the rewriter is ready before the first request.
+_load_pincode_master()
+
+
+# Matches: UPPER(district)=UPPER('X'), UPPER(district)='X', district=UPPER('X'),
+# district='X'  — in any case, with arbitrary whitespace. UPPER/LOWER/no-wrap
+# on either side are all handled.
+_DISTRICT_EQ_RE = re.compile(
+    r"""
+    (?:(?:UPPER|LOWER)\s*\(\s*)?     # optional UPPER(/LOWER( around the column
+    \bdistrict\b                     # the column
+    (?:\s*\))?                       # optional matching )
+    \s*=\s*
+    (?:(?:UPPER|LOWER)\s*\(\s*)?     # optional UPPER(/LOWER( around the value
+    '([^']+)'                        # the literal (captured)
+    (?:\s*\))?                       # optional matching )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def rewrite_district_filter(sql: str) -> str:
+    """Replace dirty `district = 'X'` predicates with an equivalent pincode
+    IN-list drawn from the authoritative master. Queries that don't mention
+    a district filter, or that reference an unknown district, pass through
+    unchanged."""
+    if not sql or not _DISTRICT_TO_PINCODES:
+        return sql
+
+    def _replace(m: re.Match) -> str:
+        name = _normalize_district_name(m.group(1))
+        pincodes = _DISTRICT_TO_PINCODES.get(name)
+        if not pincodes:
+            # Unknown district (e.g. tiny enclave not in IPPB CSV) — keep
+            # the original predicate so the DB can still try to answer.
+            return m.group(0)
+        in_list = ",".join(f"'{p}'" for p in pincodes)
+        return f"pensioner_pincode IN ({in_list})"
+
+    return _DISTRICT_EQ_RE.sub(_replace, sql)
+
+
 NL2SQL_MODEL = os.getenv("NL2SQL_MODEL", "MPX0222forHF/SQL-R1-7B")
 
 
@@ -619,6 +709,11 @@ async def ask_ai(req: AskAIRequest):
                 "sql": sql, "data": None, "total_rows": 0, "elapsed": elapsed
             }
 
+        # Normalize dirty district filters against the pincode-master before
+        # execution. The returned SQL is what we both run AND echo back to
+        # the frontend, so the "sql" field in the response stays honest.
+        sql = rewrite_district_filter(sql)
+
         try:
             rows = execute_sql(sql)
         except mysql.connector.Error as db_err:
@@ -639,6 +734,7 @@ async def ask_ai(req: AskAIRequest):
                 )
                 retry_sql = (retry_response.get("sql") or "").strip().rstrip(';').strip()
                 if is_safe_read_sql(retry_sql):
+                    retry_sql = rewrite_district_filter(retry_sql)
                     rows = execute_sql(retry_sql)
                     sql = retry_sql
                     reply = retry_response.get("reply") or reply
