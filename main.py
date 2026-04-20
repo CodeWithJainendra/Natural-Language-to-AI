@@ -61,7 +61,9 @@ DB_CONFIG = {
     "port": int(os.getenv("DB_PORT", 3306)),
     "user": os.getenv("DB_USER", "nsrivast"),
     "password": os.getenv("DB_PASSWORD", "ns#601"),
-    "database": os.getenv("DB_NAME", "doppw"),
+    # Default switched to doppw_test while the all_pensioners_clean view (backed
+    # by pincode_master) is live. Set DB_NAME=doppw to revert to the raw table.
+    "database": os.getenv("DB_NAME", "doppw_test"),
 }
 
 # ── LLM Config (local Ollama by default; can point to any OpenAI-compatible API) ──
@@ -98,7 +100,8 @@ CREATE TABLE pensioners_live_data (
 
 
 _STATIC_DDL_FALLBACK = """
-CREATE TABLE all_pensioners (
+-- Use this view; it canonicalises state/district via pincode_master.
+CREATE TABLE all_pensioners_clean (
     id INT PRIMARY KEY AUTO_INCREMENT,
     file_name VARCHAR(255),
     sheet_name VARCHAR(255),
@@ -130,7 +133,7 @@ def _build_all_pensioners_ddl() -> str:
 
         def distinct(col: str, limit: int | None = None) -> list[str]:
             q = (
-                f"SELECT DISTINCT {col} FROM all_pensioners "
+                f"SELECT DISTINCT {col} FROM all_pensioners_clean "
                 f"WHERE {col} IS NOT NULL AND {col} != '' AND {col} != 'null' "
                 f"ORDER BY {col}"
             )
@@ -147,7 +150,7 @@ def _build_all_pensioners_ddl() -> str:
         districts = distinct("district", limit=20)
 
         cur.execute(
-            "SELECT COUNT(*) FROM all_pensioners "
+            "SELECT COUNT(*) FROM all_pensioners_clean "
             "WHERE pensioner_DLC_type IS NOT NULL AND pensioner_DLC_type != ''"
         )
         dlc_populated = cur.fetchone()[0] > 0
@@ -171,7 +174,11 @@ def _build_all_pensioners_ddl() -> str:
             bank_note += ", … (50 shown)"
 
         ddl = f"""
-CREATE TABLE all_pensioners (
+-- Query this view, not the raw all_pensioners table. The view uses
+-- pincode_master to replace dirty district/state values with their
+-- authoritative equivalents, so WHERE district = 'X' is reliable.
+CREATE VIEW all_pensioners_clean AS SELECT ... FROM all_pensioners JOIN pincode_master ...;
+CREATE TABLE all_pensioners_clean (
     id INT PRIMARY KEY AUTO_INCREMENT,
     file_name VARCHAR(255) COMMENT 'Source file the row was ingested from',
     sheet_name VARCHAR(255) COMMENT 'Source sheet name within the ingestion file',
@@ -580,6 +587,79 @@ def rewrite_district_filter(sql: str) -> str:
     return _DISTRICT_EQ_RE.sub(_replace, sql)
 
 
+# ── LLM typo guard ──────────────────────────────────────────────────────────
+# The LLM occasionally drops a letter from district names (observed case:
+# "GHAZIABAD" → "GAZIABAD"), which then returns zero rows. Before execution
+# we scan WHERE district = '…' / state = '…' literals and, if the value isn't
+# a known district / state in pincode_master, fuzzy-match it to the closest
+# canonical name (difflib is stdlib, no extra dep). Threshold is conservative
+# (0.82) so only clear typos get auto-corrected; everything else is left as-is.
+
+import difflib
+
+_KNOWN_DISTRICTS: set = set()
+_KNOWN_STATES: set = set()
+
+
+def _load_known_names_from_master() -> None:
+    """Build canonical district/state name sets from the already-loaded master."""
+    global _KNOWN_DISTRICTS, _KNOWN_STATES
+    try:
+        with open(_PINCODE_MASTER_PATH, encoding="utf-8") as f:
+            master = json.load(f)
+    except Exception:
+        return
+    _KNOWN_DISTRICTS = {_normalize_district_name(v.get("district", "")) for v in master.values()}
+    _KNOWN_DISTRICTS.discard("")
+    _KNOWN_STATES = {_normalize_district_name(v.get("state", "")) for v in master.values()}
+    _KNOWN_STATES.discard("")
+    print(f"[typo-guard] loaded {len(_KNOWN_DISTRICTS)} districts, {len(_KNOWN_STATES)} states")
+
+
+_load_known_names_from_master()
+
+
+# Matches `col = 'value'` with optional UPPER()/LOWER() wraps on either side.
+# Column name captured at group 1, literal value at group 2.
+_COL_EQ_RE = re.compile(
+    r"""
+    (?:(?:UPPER|LOWER)\s*\(\s*)?
+    \b(state|district)\b
+    (?:\s*\))?
+    \s*=\s*
+    (?:(?:UPPER|LOWER)\s*\(\s*)?
+    '([^']+)'
+    (?:\s*\))?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def fix_typos_in_sql(sql: str, fuzzy_cutoff: float = 0.82) -> str:
+    """Auto-correct obvious typos in state/district literals inside WHERE
+    clauses, using pincode_master as the canonical vocabulary. Never touches
+    literals that already match; silent no-op if master didn't load."""
+    if not sql or (not _KNOWN_DISTRICTS and not _KNOWN_STATES):
+        return sql
+
+    def _repl(m: re.Match) -> str:
+        col = m.group(1).lower()
+        literal = m.group(2)
+        norm = _normalize_district_name(literal)
+        vocab = _KNOWN_DISTRICTS if col == "district" else _KNOWN_STATES
+        if norm in vocab:
+            return m.group(0)  # exact match, nothing to do
+        candidates = difflib.get_close_matches(norm, vocab, n=1, cutoff=fuzzy_cutoff)
+        if not candidates:
+            return m.group(0)  # no close match — leave alone
+        corrected = candidates[0]
+        print(f"[typo-guard] {col}='{literal}' → '{corrected}'")
+        # Preserve the exact surrounding syntax; only swap the literal.
+        return m.group(0).replace(f"'{literal}'", f"'{corrected}'")
+
+    return _COL_EQ_RE.sub(_repl, sql)
+
+
 NL2SQL_MODEL = os.getenv("NL2SQL_MODEL", "MPX0222forHF/SQL-R1-7B")
 
 
@@ -709,10 +789,18 @@ async def ask_ai(req: AskAIRequest):
                 "sql": sql, "data": None, "total_rows": 0, "elapsed": elapsed
             }
 
-        # Normalize dirty district filters against the pincode-master before
-        # execution. The returned SQL is what we both run AND echo back to
-        # the frontend, so the "sql" field in the response stays honest.
-        sql = rewrite_district_filter(sql)
+        # Auto-correct common LLM typos in district/state literals against
+        # pincode_master (e.g. "GAZIABAD" → "GHAZIABAD"). Exact matches are
+        # left alone; only close misspellings are fixed.
+        sql = fix_typos_in_sql(sql)
+
+        # Pincode-master rewriter DISABLED: we now query all_pensioners_clean
+        # (a view that already canonicalises district/state via pincode_master),
+        # so a per-query regex rewrite is redundant. Toggle back on by setting
+        # NL2SQL_REWRITE=1 if we ever need the stricter (pincode-IN-list)
+        # semantics over the view's permissive COALESCE behavior.
+        if os.getenv("NL2SQL_REWRITE") == "1":
+            sql = rewrite_district_filter(sql)
 
         try:
             rows = execute_sql(sql)
@@ -734,7 +822,9 @@ async def ask_ai(req: AskAIRequest):
                 )
                 retry_sql = (retry_response.get("sql") or "").strip().rstrip(';').strip()
                 if is_safe_read_sql(retry_sql):
-                    retry_sql = rewrite_district_filter(retry_sql)
+                    retry_sql = fix_typos_in_sql(retry_sql)
+                    if os.getenv("NL2SQL_REWRITE") == "1":
+                        retry_sql = rewrite_district_filter(retry_sql)
                     rows = execute_sql(retry_sql)
                     sql = retry_sql
                     reply = retry_response.get("reply") or reply
