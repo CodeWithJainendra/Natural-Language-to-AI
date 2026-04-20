@@ -660,6 +660,41 @@ def fix_typos_in_sql(sql: str, fuzzy_cutoff: float = 0.82) -> str:
     return _COL_EQ_RE.sub(_repl, sql)
 
 
+# ── Pincode-count strictness ────────────────────────────────────────────────
+# The hybrid view `all_pensioners_clean` keeps every pensioner (canonicalising
+# district via master when possible, falling back to raw DB value otherwise)
+# so district/state totals stay whole. But COUNT(DISTINCT pensioner_pincode)
+# without a filter picks up 91 "Lucknow" pincodes — master-known 43 plus 48
+# that are merely DB-tagged. That disagrees with the dashboard table, which
+# only renders master-validated pincodes. To keep the two in sync we nudge
+# pincode-count queries to the strict subset by appending
+# `AND pincode_validated = 1` to their WHERE clause.
+
+_COUNT_PINCODES_RE = re.compile(
+    r"count\s*\(\s*distinct\s+pensioner_pincode\s*\)",
+    re.IGNORECASE,
+)
+
+
+def enforce_pincode_validation(sql: str) -> str:
+    """If a query counts DISTINCT pincodes, require pincode_validated = 1
+    so the answer aligns with the master-authoritative pincode list the
+    dashboard shows. Queries that don't count pincodes pass through."""
+    if not sql or not _COUNT_PINCODES_RE.search(sql):
+        return sql
+    # Don't double-apply if the predicate is already there.
+    if re.search(r"pincode_validated\s*=\s*1", sql, re.IGNORECASE):
+        return sql
+    # Add to existing WHERE clause; if there's no WHERE at all the LLM
+    # didn't mean a district/state filter, so leave it alone.
+    m = re.search(r"(?i)\bwhere\b", sql)
+    if not m:
+        return sql
+    # Insert right after the WHERE keyword so precedence is unambiguous.
+    idx = m.end()
+    return sql[:idx] + " pincode_validated = 1 AND" + sql[idx:]
+
+
 NL2SQL_MODEL = os.getenv("NL2SQL_MODEL", "MPX0222forHF/SQL-R1-7B")
 
 
@@ -794,6 +829,10 @@ async def ask_ai(req: AskAIRequest):
         # left alone; only close misspellings are fixed.
         sql = fix_typos_in_sql(sql)
 
+        # Align pincode-count answers with the dashboard's master-validated
+        # pincode list (43 for Lucknow instead of 91, etc.).
+        sql = enforce_pincode_validation(sql)
+
         # Pincode-master rewriter DISABLED: we now query all_pensioners_clean
         # (a view that already canonicalises district/state via pincode_master),
         # so a per-query regex rewrite is redundant. Toggle back on by setting
@@ -823,6 +862,7 @@ async def ask_ai(req: AskAIRequest):
                 retry_sql = (retry_response.get("sql") or "").strip().rstrip(';').strip()
                 if is_safe_read_sql(retry_sql):
                     retry_sql = fix_typos_in_sql(retry_sql)
+                    retry_sql = enforce_pincode_validation(retry_sql)
                     if os.getenv("NL2SQL_REWRITE") == "1":
                         retry_sql = rewrite_district_filter(retry_sql)
                     rows = execute_sql(retry_sql)
