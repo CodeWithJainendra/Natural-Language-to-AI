@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -17,10 +18,17 @@ from nl2sql import load_model, build_prompt, tokenize_prompt, generate_output, e
 from preprocessing import preprocess_nl2sql_question
 
 
+# root_path tells FastAPI it's mounted behind a reverse proxy at this prefix
+# (Apache /dlc-backend-test → DLCServer:9010 → /api/nl2sql/* → here:8000).
+# Without this, Swagger UI loads at the public URL but its JS fetches
+# /openapi.json on the bare root and 404s. Leave unset for direct localhost use.
+ROOT_PATH = os.getenv("ROOT_PATH", "")
+
 app = FastAPI(
     title="NL2SQL API",
     description="Convert NL questions to SQL queries using HuggingFace models.",
-    version="2.0.0"
+    version="2.0.0",
+    root_path=ROOT_PATH,
 )
 
 _origins_env = os.getenv("ALLOWED_ORIGINS", "*")
@@ -32,6 +40,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Optional API-key auth ──────────────────────────────────────────────────
+# If NL2SQL_API_KEY is set in .env, every request (except the Swagger/OpenAPI
+# doc paths) must carry a matching `X-API-Key` header. If the env var is
+# unset, the middleware is a no-op — useful for pure-localhost dev. The
+# DLCServer proxy passes the same key so the in-app /ask-ai flow is unaffected.
+_API_KEY = os.getenv("NL2SQL_API_KEY", "").strip()
+_AUTH_EXEMPT_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
+
+
+@app.middleware("http")
+async def _require_api_key(request: Request, call_next):
+    if not _API_KEY:
+        return await call_next(request)
+    if request.method == "OPTIONS" or request.url.path in _AUTH_EXEMPT_PATHS:
+        return await call_next(request)
+    if request.headers.get("x-api-key", "") != _API_KEY:
+        return JSONResponse(
+            {"success": False, "message": "Unauthorized: missing or invalid X-API-Key."},
+            status_code=401,
+        )
+    return await call_next(request)
 
 # How often the background task re-introspects the live DB to refresh the
 # schema prompt. Defaults to 24 hours — matches the nightly ingestion
@@ -94,9 +124,11 @@ CREATE TABLE pensioners_live_data (
     UNIQUE KEY uq_ppo_fetch (ppo, fetch_id)
 );
 
--- Note: all_pensioners is the primary reporting table for DLC analytics.
--- pensioners_live_data holds the latest live snapshot per (ppo, fetch_id).
--- Prefer all_pensioners unless the user explicitly asks for live/current data."""
+-- Note: all_pensioners_clean is the primary reporting view for DLC analytics
+-- and is what the live dashboard queries. Never target the raw all_pensioners
+-- table — its district/state columns are dirty. pensioners_live_data holds
+-- the latest live snapshot per (ppo, fetch_id); use it only if the user
+-- explicitly asks for "live" or "current snapshot" data."""
 
 
 _STATIC_DDL_FALLBACK = """
@@ -239,6 +271,9 @@ INTERPRETATION RULES (READ CAREFULLY — this is the most important part):
 - Users often type with TYPOS, missing punctuation, incomplete grammar, mixed Hindi/English (Hinglish), SMS shorthand, or vague phrasing. Your job is to REASON about intent, not reject the query.
 - Before giving up, try to map every user utterance to the schema columns above. Examples:
     • "kitne pensioner hai bihar mein" → COUNT(*) for state='BIHAR'
+    • "total pensioners" / "kul pensioner" → COUNT(*) AS total_pensioners
+    • "total DLC" / "DLC total" / "total DLC done" / "DLC count" → COUNT(lc_date) AS dlc_done  (when user says "DLC" with "total/count" they mean DLC-completed, NOT all pensioners)
+    • "DLC pending" / "pending DLC" / "kitne pending" → COUNT(*) - COUNT(lc_date) AS dlc_pending, or COUNT(*) FROM ... WHERE lc_date IS NULL
     • "top banks"                     → GROUP BY bank_name with completion_rate
     • "age wise breakdown"            → derive age-bucket from YOB
     • "208016 ka data"                → WHERE pensioner_pincode='208016'
@@ -263,19 +298,28 @@ STRICT RULES:
 3. Off-topic questions (jokes, general knowledge, personal chat) — politely decline; intent=chat.
 4. Simple greetings (hi, hello, namaste) are OK — respond briefly.
 5. Use UPPER(state)=UPPER('value') and UPPER(district)=UPPER('value') for case-insensitive matches.
-6. Metric formulas (USE EXACTLY):
-    - DLC done            = COUNT(lc_date)
-    - DLC pending         = COUNT(*) - COUNT(lc_date)
+6. Metric formulas (USE EXACTLY — these must match the dashboard cards):
+    - total_pensioners    = COUNT(*)                              -- alias AS total_pensioners
+    - dlc_done            = COUNT(lc_date)                        -- alias AS dlc_done / dlc_issued
+    - dlc_pending         = COUNT(*) - COUNT(lc_date)             -- alias AS dlc_pending
     - completion_rate     = ROUND(COUNT(lc_date) * 100.0 / NULLIF(COUNT(*),0), 1)
     - conversion_potential= ROUND(SUM(CASE WHEN lc_date IS NULL AND last_year_lc_type='DLC' THEN 0 ELSE 1 END)*100.0/NULLIF(COUNT(*),0), 1)
+   CRITICAL: "total DLC", "DLC total", "DLC done", "DLC issued", "kitne DLC ho gaye", "how many DLC" → use COUNT(lc_date), NEVER COUNT(*). COUNT(*) counts every pensioner (including pending); COUNT(lc_date) counts only those whose Life Certificate is completed.
 7. For "top"/"best" queries include counts AND completion_rate, ORDER BY completion_rate DESC, total_pensioners DESC.
    For "worst"/"lowest"/"least"/"bottom"/"kam" ORDER BY completion_rate ASC.
 8. LIMIT to 10 unless the user specifies a number.
 9. NEVER generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE. SELECT-only.
-10. Always qualify with IS NOT NULL filters for GROUP BY dimensions and exclude literal string 'null'. Example:
-     WHERE state IS NOT NULL AND state != 'null' AND state != ''
-11. Prefer all_pensioners as the data source. Use pensioners_live_data only if user explicitly asks for "live" or "current snapshot".
-12. Reply in the same language as the user (English / Hindi / Hinglish). Keep `reply` under 2 short sentences.
+10. Add IS NOT NULL / != 'null' / != '' filters ONLY when a column is used as a GROUP BY dimension. Example (correct):
+     SELECT state, COUNT(*) FROM all_pensioners_clean WHERE state IS NOT NULL AND state != 'null' AND state != '' GROUP BY state
+    Do NOT add these filters to plain all-India totals — they silently drop 300+ rows with empty state and disagree with the dashboard. "Total pensioners in India" must be exactly:
+     SELECT COUNT(*) AS total_pensioners FROM all_pensioners_clean
+11. The ONLY valid reporting source is `all_pensioners_clean`. Every SELECT must FROM all_pensioners_clean (or join it). Do NOT reference the raw `all_pensioners` table — it has dirty district/state values and its counts will disagree with the dashboard. Use pensioners_live_data only if user explicitly asks for "live" or "current snapshot".
+12. The `reply` text must label the metric accurately — mirror what the user asked. Examples:
+    • user asks "total pensioners"  → reply: "Total Pensioners: X"
+    • user asks "total DLC" / "DLC done" → reply: "Total DLC Done: X" (NEVER "Total Pensioners: X")
+    • user asks "DLC pending" → reply: "DLC Pending: X"
+    Aligning the label with the metric avoids confusion when counts look similar.
+13. Reply in the same language as the user (English / Hindi / Hinglish). Keep `reply` under 2 short sentences.
 
 OUTPUT FORMAT — you MUST respond with ONLY a single JSON object, no markdown, no prose around it:
 {"intent":"chat","reply":"<short message>","sql":null}
@@ -348,7 +392,7 @@ async def call_llm(question: str, extra_messages: Optional[list] = None) -> dict
     payload = {
         "model": LLM_MODEL,
         "messages": messages,
-        "temperature": 0.1,
+        "temperature": 0.0,
         "max_tokens": 16384,
         "response_format": {"type": "json_object"},
     }
@@ -772,6 +816,18 @@ async def ask_ai(req: AskAIRequest):
             "sql": None, "data": None, "total_rows": 0, "elapsed": 0.0,
         }
 
+    # ── Deterministic disambiguation for a stubborn short-phrase case ──
+    # "total DLC" (and close variants) consistently confuse the LLM into
+    # emitting COUNT(*) on the dominant token "total", rather than the
+    # domain-correct COUNT(lc_date). Prompt-engineering failed to budge it,
+    # so rewrite these exact short queries before the model ever sees them.
+    # Longer/filtered queries ("total DLC in Delhi", "total DLC breakdown")
+    # stay untouched — they're handled fine by the regular pipeline.
+    _short = re.sub(r"[?!.\s]+", " ", (question or "").strip().lower()).strip()
+    if _short in {"total dlc", "dlc total", "dlc count", "total dlc count",
+                  "kul dlc", "dlc kul", "kitne dlc"}:
+        question = "How many DLC are done? (use COUNT(lc_date) AS dlc_done)"
+
     # ── Preprocessing layer: big LLM fixes typos / Hinglish / ambiguous phrasing and filters off-domain ──
     try:
         pp = preprocess_nl2sql_question(question, ALL_PENSIONERS_DDL)
@@ -908,3 +964,48 @@ async def ask_ai(req: AskAIRequest):
             "success": False,
             "message": f"Something went wrong: {str(e)}"
         }
+
+
+# ── Clean integration-friendly wrapper ─────────────────────────────────────
+# /ask-ai exposes internals (generated SQL, elapsed seconds, answer_type flag)
+# that external integrators usually don't want to handle. /chat is the same
+# pipeline (preprocess → LLM → SQL → execute → format) but returns only the
+# user-facing answer and optional tabular rows. Drop-in for chat UIs, Slack
+# bots, dashboards, etc.
+
+class ChatRequest(BaseModel):
+    question: str
+
+
+class ChatResponse(BaseModel):
+    success: bool
+    answer: str
+    data: Optional[list] = None
+    total_rows: int = 0
+
+
+@app.post("/chat", tags=["Chat"], response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    """Integration-friendly Q&A endpoint. Ask a natural-language question
+    about DLC pension data; get back the AI's answer (and tabular rows if
+    the question resolves to a data query). No SQL, timings, or internals
+    in the response.
+
+    Example request:
+        {"question": "top 5 states by DLC completion"}
+
+    Example response:
+        {
+          "success": true,
+          "answer": "Top 5 states by DLC completion:",
+          "data": [{"state": "haryana", "all_pensioner_count": 148359, ...}, ...],
+          "total_rows": 5
+        }
+    """
+    result = await ask_ai(AskAIRequest(question=req.question))
+    return ChatResponse(
+        success=bool(result.get("success", False)),
+        answer=result.get("message", ""),
+        data=result.get("data") or None,
+        total_rows=int(result.get("total_rows", 0) or 0),
+    )
