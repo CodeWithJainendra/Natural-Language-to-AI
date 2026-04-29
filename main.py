@@ -663,6 +663,156 @@ def _load_known_names_from_master() -> None:
 _load_known_names_from_master()
 
 
+# ── Unmapped-data handler (deterministic, skips the LLM) ────────────────────
+# The frontend's "Inaccurate District/Pincode Data" panels expose rows whose
+# district/pincode is tagged on a pensioner row but isn't in pincode-master.
+# Users can ask the AI for the same data via natural language — this handler
+# matches those queries up-front and serves the answer directly from the raw
+# `all_pensioners` table partitioned against the master, so the LLM never
+# has to invent it (the regular pipeline only sees `all_pensioners_clean`,
+# which by definition strips unmapped rows).
+
+_STATE_TO_MASTER_DISTRICTS: dict = {}
+_STATE_TO_MASTER_PINCODES: dict = {}
+
+
+def _load_state_to_master_indices() -> None:
+    global _STATE_TO_MASTER_DISTRICTS, _STATE_TO_MASTER_PINCODES
+    try:
+        with open(_PINCODE_MASTER_PATH, encoding="utf-8") as f:
+            master = json.load(f)
+    except Exception:
+        return
+    d_idx: dict = {}
+    p_idx: dict = {}
+    for pin, meta in master.items():
+        s = _normalize_district_name(meta.get("state", ""))
+        d = _normalize_district_name(meta.get("district", ""))
+        if not s:
+            continue
+        if d:
+            d_idx.setdefault(s, set()).add(d)
+        p_idx.setdefault(s, set()).add(str(pin))
+    _STATE_TO_MASTER_DISTRICTS = d_idx
+    _STATE_TO_MASTER_PINCODES = p_idx
+
+
+_load_state_to_master_indices()
+
+
+_UNMAPPED_RE = re.compile(
+    r"\b(unmapped|invalid|missing|inaccurate|not\s+in\s+(?:the\s+)?master)\b"
+    r"[^.\n]*?\b(districts?|pincodes?|pin\s*codes?)\b"
+    r"(?:[^.\n]*?\b(?:in|of|for|under|tagged\s+to)\s+(?P<state>[a-zA-Z][a-zA-Z\s&\.\-]{1,40}?))?"
+    r"\s*[\?.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _resolve_state(raw: str) -> Optional[str]:
+    """Return a canonical (UPPER) state name from a free-text fragment, or None."""
+    if not raw:
+        return None
+    norm = _normalize_district_name(raw)
+    if norm in _KNOWN_STATES:
+        return norm
+    matches = difflib.get_close_matches(norm, _KNOWN_STATES, n=1, cutoff=0.78)
+    return matches[0] if matches else None
+
+
+def try_unmapped_handler(question: str) -> Optional[dict]:
+    """Detect 'show unmapped districts/pincodes in <state>' and answer directly.
+    Returns None when the question doesn't match (regular pipeline takes over)."""
+    if not question or not _STATE_TO_MASTER_DISTRICTS:
+        return None
+    m = _UNMAPPED_RE.search(question)
+    if not m:
+        return None
+
+    kind_raw = m.group(2).lower()
+    is_district = "district" in kind_raw
+    state_raw = (m.group("state") or "").strip()
+    state = _resolve_state(state_raw) if state_raw else None
+
+    try:
+        if is_district:
+            master_set = _STATE_TO_MASTER_DISTRICTS.get(state, set()) if state else None
+            where_state = "UPPER(state) = %s" if state else "state IS NOT NULL AND state != '' AND state != 'null'"
+            sql = (
+                "SELECT district AS name, "
+                "       COUNT(*) AS total_pensioners, "
+                "       COUNT(lc_date) AS dlc_done "
+                "FROM all_pensioners "
+                f"WHERE {where_state} "
+                "  AND district IS NOT NULL AND district != '' AND district != 'null' "
+                "GROUP BY district "
+                "ORDER BY total_pensioners DESC"
+            )
+            params = (state,) if state else ()
+            conn = mysql.connector.connect(**DB_CONFIG)
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            if state:
+                rows = [r for r in rows if _normalize_district_name(r.get("name")) not in master_set]
+            else:
+                all_master_districts: set = set()
+                for s in _STATE_TO_MASTER_DISTRICTS.values():
+                    all_master_districts |= s
+                rows = [r for r in rows if _normalize_district_name(r.get("name")) not in all_master_districts]
+        else:
+            master_set = _STATE_TO_MASTER_PINCODES.get(state, set()) if state else None
+            where_state = "UPPER(state) = %s" if state else "state IS NOT NULL AND state != '' AND state != 'null'"
+            sql = (
+                "SELECT pensioner_pincode AS name, "
+                "       COUNT(*) AS total_pensioners, "
+                "       COUNT(lc_date) AS dlc_done "
+                "FROM all_pensioners "
+                f"WHERE {where_state} "
+                "  AND pensioner_pincode IS NOT NULL AND pensioner_pincode != '' "
+                "GROUP BY pensioner_pincode "
+                "ORDER BY total_pensioners DESC"
+            )
+            params = (state,) if state else ()
+            conn = mysql.connector.connect(**DB_CONFIG)
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            if state:
+                rows = [r for r in rows if str(r.get("name")) not in master_set]
+            else:
+                all_master_pins: set = set()
+                for s in _STATE_TO_MASTER_PINCODES.values():
+                    all_master_pins |= s
+                rows = [r for r in rows if str(r.get("name")) not in all_master_pins]
+    except Exception as err:
+        print(f"[unmapped-handler] failed: {err}")
+        return None
+
+    label = "district" if is_district else "pincode"
+    plural = "entries" if len(rows) != 1 else "entry"
+    where_text = f" in {state.title()}" if state else ""
+
+    if not rows:
+        return {
+            "success": True, "answer_type": "text",
+            "message": f"No unmapped {label}s found{where_text} — every {label} in the database is in the authoritative master.",
+            "sql": sql, "data": [], "total_rows": 0, "elapsed": 0.0,
+        }
+    return {
+        "success": True, "answer_type": "table",
+        "message": (
+            f"Found {len(rows)} unmapped {label} {plural}{where_text} — "
+            f"these {label}s are tagged in the database but not in the authoritative master."
+        ),
+        "sql": sql, "data": rows, "total_rows": len(rows), "elapsed": 0.0,
+    }
+
+
 # Matches `col = 'value'` with optional UPPER()/LOWER() wraps on either side.
 # Column name captured at group 1, literal value at group 2.
 _COL_EQ_RE = re.compile(
@@ -827,6 +977,12 @@ async def ask_ai(req: AskAIRequest):
     if _short in {"total dlc", "dlc total", "dlc count", "total dlc count",
                   "kul dlc", "dlc kul", "kitne dlc"}:
         question = "How many DLC are done? (use COUNT(lc_date) AS dlc_done)"
+
+    # ── Deterministic short-circuit for "unmapped/invalid/missing X in <state>"
+    # queries. Falls through (returns None) for everything else.
+    _unmapped_resp = try_unmapped_handler(question)
+    if _unmapped_resp is not None:
+        return _unmapped_resp
 
     # ── Preprocessing layer: big LLM fixes typos / Hinglish / ambiguous phrasing and filters off-domain ──
     try:
